@@ -23,6 +23,7 @@ class DoomEnv:
         
         # Basic.cfg has 3 available buttons: MOVE_LEFT, MOVE_RIGHT, ATTACK
         self.action_space_size = self.game.get_available_buttons_size()
+        self.num_actions = self.action_space_size
         self.preprocess = preprocess
         
     def reset(self):
@@ -35,14 +36,23 @@ class DoomEnv:
     def step(self, action):
         """
         Executes an action, returns (observation, reward, done, info).
-        Action should be a list/array of button states, e.g. [1, 0, 0].
+        Action can be an integer index (e.g. 0, 1, 2) or a list/array of button states, e.g. [1, 0, 0].
         """
+        if isinstance(action, (int, np.integer)):
+            action_vec = [0] * self.action_space_size
+            action_vec[int(action)] = 1
+        elif isinstance(action, (list, tuple, np.ndarray)):
+            action_vec = list(action)
+        else:
+            action_vec = [0] * self.action_space_size
+            action_vec[int(action)] = 1
+
         # make_action advances the environment by 1 tick and returns the reward
-        reward = self.game.make_action(action)
+        reward = self.game.make_action(action_vec)
         
         # REWARD SHAPING: Penalize the agent for shooting to stop blind firing.
-        # action[2] corresponds to the ATTACK button.
-        if action[2] == 1:
+        # action_vec[2] corresponds to the ATTACK button.
+        if len(action_vec) > 2 and action_vec[2] == 1:
             reward -= 5.0
             
         done = self.game.is_episode_finished()
