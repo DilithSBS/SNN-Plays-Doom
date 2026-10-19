@@ -1,0 +1,19 @@
+# Core Dependencies for SNN-Plays-Doom
+# Compatible with Python 3.10, 3.11, 3.12
+
+# Deep Learning Framework
+torch>=2.0.0
+torchvision>=0.15.0
+
+# ViZDoom Reinforcement Learning Environment
+vizdoom>=1.2.0
+
+# Numerical Computing & Computer Vision
+numpy>=1.24.0
+opencv-python>=4.8.0
+
+# Visualization & Plotting
+matplotlib>=3.7.0
+
+# Utilities
+tqdm>=4.65.0

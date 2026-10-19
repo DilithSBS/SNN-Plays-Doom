@@ -20,7 +20,7 @@ def evaluate_model(model_path="checkpoints/ann_policy_best.pth", episodes=10, re
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     model = SimpleCNN(input_channels=1, num_actions=n_actions)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.to(device)
     model.eval()  # Set to evaluation mode (no gradients, no dropout)
     
@@ -67,5 +67,15 @@ def evaluate_model(model_path="checkpoints/ann_policy_best.pth", episodes=10, re
     print("------------------------------\n")
 
 if __name__ == "__main__":
-    # To watch the agent play, change render to True
-    evaluate_model(episodes=10, render=True)
+    import argparse
+    parser = argparse.ArgumentParser(description="Evaluate trained CNN (ANN) policy in ViZDoom")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/ann_policy_best.pth", help="Path to ANN checkpoint")
+    parser.add_argument("--episodes", type=int, default=10, help="Number of evaluation episodes")
+    parser.add_argument("--no-render", action="store_true", help="Disable live ViZDoom window for headless/fast benchmarking")
+    args = parser.parse_args()
+
+    evaluate_model(
+        model_path=args.checkpoint,
+        episodes=args.episodes,
+        render=not args.no_render
+    )

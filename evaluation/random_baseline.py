@@ -47,6 +47,11 @@ def evaluate_random_agent(episodes=5, render=False):
     print("------------------------\n")
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Evaluate random baseline agent in ViZDoom")
+    parser.add_argument("--episodes", type=int, default=10, help="Number of baseline episodes")
+    parser.add_argument("--no-render", action="store_true", help="Disable live ViZDoom window for headless/fast benchmarking")
+    args = parser.parse_args()
+
     print("Starting Random Baseline Evaluation...\n")
-    # Set render=True if you want to watch the agent!
-    evaluate_random_agent(episodes=10, render=True)
+    evaluate_random_agent(episodes=args.episodes, render=not args.no_render)
