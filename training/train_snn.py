@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-# Ensure project root is on sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -18,7 +17,7 @@ from models.snn.spiking_cnn import SpikingDuelingDQN
 
 
 class ReplayBuffer:
-    """Lightweight, memory-efficient Experience Replay Buffer."""
+    """Experience Replay Buffer with 5-Action Horizontal Data Augmentation."""
     def __init__(self, capacity: int = 50_000):
         self.buffer = deque(maxlen=capacity)
 
@@ -35,6 +34,22 @@ class ReplayBuffer:
         rewards_t = torch.as_tensor(rewards, dtype=torch.float32, device=device).unsqueeze(1)
         dones_t = torch.as_tensor(dones, dtype=torch.float32, device=device).unsqueeze(1)
 
+        # -----------------------------------------------------------------
+        # HORIZONTAL AUGMENTATION ACROSS 5 ACTIONS (50% probability)
+        # -----------------------------------------------------------------
+        if random.random() < 0.5:
+            # Flip image across width axis (dim 3 for (B, 4, 84, 84))
+            states_t = torch.flip(states_t, dims=[3])
+            next_states_t = torch.flip(next_states_t, dims=[3])
+
+            # Swap: 0 (Left) <-> 1 (Right), 3 (Left+Shoot) <-> 4 (Right+Shoot)
+            swapped = actions_t.clone()
+            swapped[actions_t == 0] = 1
+            swapped[actions_t == 1] = 0
+            swapped[actions_t == 3] = 4
+            swapped[actions_t == 4] = 3
+            actions_t = swapped
+
         return states_t, actions_t, rewards_t, next_states_t, dones_t
 
     def __len__(self):
@@ -42,39 +57,30 @@ class ReplayBuffer:
 
 
 def format_state(state) -> np.ndarray:
-    """
-    Ensures every single observation from DoomEnv has shape (C, 84, 84) as a float32/uint8 numpy array.
-    """
+    """Standardizes DoomEnv observations to shape (4, 84, 84)."""
     if isinstance(state, torch.Tensor):
         state = state.detach().cpu().numpy()
     state = np.asarray(state)
 
-    # Strip leading batch dimension if DoomEnv returns (1, 1, 84, 84)
     if state.ndim == 4 and state.shape[0] == 1:
         state = state.squeeze(0)
-    # Add channel dimension if DoomEnv returns (84, 84)
     elif state.ndim == 2:
         state = np.expand_dims(state, axis=0)
-    # Permute if HWC (84, 84, C)
     elif state.ndim == 3 and state.shape[-1] in (1, 3, 4) and state.shape[0] == 84:
         state = np.transpose(state, (2, 0, 1))
 
     return state
 
-def to_vizdoom_action(env, action_idx: int, num_actions: int = 3) -> list[int]:
-    """
-    Converts an integer action index (0, 1, 2) into a ViZDoom one-hot button list
-    (e.g., [1, 0, 0], [0, 1, 0], [0, 0, 1]).
-    """
-    # If DoomEnv already stores an actions list (e.g. self.actions = [[1,0,0], ...])
-    if hasattr(env, "actions") and isinstance(env.actions, (list, tuple, np.ndarray)):
+
+def to_vizdoom_action(env, action_idx: int) -> list[int]:
+    """Retrieves action vector from environment action table."""
+    if hasattr(env, "actions"):
         return list(env.actions[action_idx])
-    
-    # Otherwise construct the one-hot action vector
-    one_hot = [0] * num_actions
+    one_hot = [0] * env.num_actions
     one_hot[action_idx] = 1
     return one_hot
-    
+
+
 @torch.no_grad()
 def select_action(
     policy_net: SpikingDuelingDQN,
@@ -83,10 +89,6 @@ def select_action(
     num_actions: int,
     device: torch.device,
 ) -> tuple[int, float]:
-    """
-    Selects an epsilon-greedy action.
-    Crucial: Places policy_net in .eval() mode so BatchNorm1d does not crash on batch_size=1.
-    """
     if random.random() < epsilon:
         return random.randint(0, num_actions - 1), 0.0
 
@@ -104,7 +106,6 @@ def select_action(
 
 
 def soft_update_target(policy_net: nn.Module, target_net: nn.Module, tau: float = 0.005):
-    """Polyak averaging for parameters and BatchNorm running buffers."""
     with torch.no_grad():
         for p_param, t_param in zip(policy_net.parameters(), target_net.parameters()):
             t_param.data.mul_(1.0 - tau).add_(p_param.data, alpha=tau)
@@ -128,30 +129,28 @@ def optimize_snn_step(
     policy_net.train()
     target_net.eval()
 
-    # 1. Forward pass through Online SNN (with differentiable firing rate)
-    q_Online, firing_rate = policy_net(states, return_firing_rate=True)
-    state_action_values = q_Online.gather(1, actions)
+    # 1. Forward pass through Online SNN
+    q_online, firing_rate = policy_net(states, return_firing_rate=True)
+    state_action_values = q_online.gather(1, actions)
 
-    # 2. Double DQN (DDQN) Target Calculation
+    # 2. DDQN Target with target network
     with torch.no_grad():
-        # Online net selects best next actions
         next_actions = policy_net(next_states, return_firing_rate=False).argmax(dim=1, keepdim=True)
-        # Target net evaluates those actions
         next_q_target = target_net(next_states, return_firing_rate=False).gather(1, next_actions)
         expected_q_values = rewards + (1.0 - dones) * gamma * next_q_target
 
-    # 3. Huber Loss + Homeostatic Firing Rate Regularization
+    # 3. Loss = Huber Loss + Firing Rate Regularization
     td_loss = nn.functional.smooth_l1_loss(state_action_values, expected_q_values)
     sparsity_loss = sparsity_weight * ((firing_rate - target_firing_rate) ** 2)
     total_loss = td_loss + sparsity_loss
 
-    # 4. Backpropagation Through Time (BPTT) with Gradient Clipping
+    # 4. Backpropagation Through Time
     optimizer.zero_grad(set_to_none=True)
     total_loss.backward()
     torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
     optimizer.step()
 
-    # 5. Soft-update target network
+    # 5. Polyak Soft Update
     soft_update_target(policy_net, target_net, tau=0.005)
 
     return float(td_loss.item()), float(firing_rate.item())
@@ -164,26 +163,25 @@ def train_snn(
     lr: float = 1e-4,
     time_steps: int = 4,
     eps_start: float = 1.0,
-    eps_end: float = 0.05,
-    eps_decay_episodes: int = 450,
+    eps_end: float = 0.08,
+    eps_decay_episodes: int = 650,
     warmup_steps: int = 2_000,
     train_freq: int = 4,
     target_firing_rate: float = 0.12,
     sparsity_weight: float = 0.05,
     checkpoint_dir: str = "checkpoints",
+    resume_from: str | None = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Initialize ViZDoom Environment
     env = DoomEnv(render=False)
     sample_obs = format_state(env.reset())
-    input_channels = sample_obs.shape[0]
-    num_actions = getattr(env, "num_actions", 3)
+    input_channels = sample_obs.shape[0]  # Automatically detects 4 channels
+    num_actions = env.num_actions        # Automatically detects 5 actions
 
-    print(f"[SNN-Doom] Device: {device} | Input Shape: {sample_obs.shape} | Actions: {num_actions} | T={time_steps}")
+    print(f"[SNN-Doom] Device: {device} | Channels: {input_channels} | Actions: {num_actions} | T={time_steps}")
 
-    # Initialize Online and Target Spiking Dueling DQNs
     policy_net = SpikingDuelingDQN(
         input_channels=input_channels,
         num_actions=num_actions,
@@ -205,37 +203,59 @@ def train_snn(
     reward_window = deque(maxlen=50)
     global_step = 0
     start_time = time.time()
+    start_episode = 1
+
+    # Load from previous checkpoint if specified
+    if resume_from is not None:
+        if os.path.exists(resume_from):
+            print(f"[Resume] Loading checkpoint from '{resume_from}'...")
+            ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+            if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+                policy_net.load_state_dict(ckpt["model_state_dict"])
+                target_net.load_state_dict(ckpt["model_state_dict"])
+                if "optimizer_state_dict" in ckpt:
+                    try:
+                        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                    except Exception:
+                        pass
+                start_episode = ckpt.get("episode", 0) + 1
+                best_avg_reward = ckpt.get("avg_reward_50", -float("inf"))
+                print(f"[Resume] Successfully loaded! Resuming from Episode {start_episode} (Prior Best Avg50: {best_avg_reward:.1f})")
+            else:
+                policy_net.load_state_dict(ckpt)
+                target_net.load_state_dict(ckpt)
+                print(f"[Resume] Successfully loaded raw state_dict into policy and target networks.")
+
+            # Default to controlled exploration (30%) if resuming, unless explicitly overridden
+            if eps_start == 1.0:
+                eps_start = 0.30
+                print(f"[Resume] Set initial epsilon exploration to {eps_start:.2f} (prevents wiping learned policy).")
+        else:
+            print(f"[Warning] Checkpoint '{resume_from}' does not exist! Starting fresh from scratch.")
 
     try:
-        for episode in range(1, num_episodes + 1):
+        for episode in range(start_episode, start_episode + num_episodes):
             state = format_state(env.reset())
             done = False
             episode_reward = 0.0
             episode_losses = []
             episode_firing_rates = []
 
-            # Linear epsilon schedule across episodes
-            progress = min(1.0, episode / float(eps_decay_episodes))
+            # Linear epsilon decay relative to remaining training episodes
+            progress = min(1.0, (episode - start_episode) / float(max(1, eps_decay_episodes)))
             epsilon = eps_start - progress * (eps_start - eps_end)
 
             while not done:
                 global_step += 1
                 action, step_fr = select_action(policy_net, state, epsilon, num_actions, device)
 
-                # Step ViZDoom environment (handles both 3-tuple and 4/5-tuple Gym returns)
-                viz_action = to_vizdoom_action(env, action, num_actions)
-                step_out = env.step(viz_action)
-                if len(step_out) == 3:
-                    next_raw_state, reward, done = step_out
-                elif len(step_out) == 4:
-                    next_raw_state, reward, done, _ = step_out
-                else:
-                    next_raw_state, reward, terminated, truncated, _ = step_out
-                    done = terminated or truncated
+                # Send action to ViZDoom
+                viz_action = to_vizdoom_action(env, action)
+                next_raw_state, reward, done, _ = env.step(viz_action)
 
                 next_state = format_state(next_raw_state) if next_raw_state is not None else np.zeros_like(state)
 
-                # Scale reward slightly if ViZDoom returns raw [-300, 100] to stabilize BPTT gradients
+                # Scaled reward for gradient stability
                 scaled_reward = float(reward) / 100.0
                 replay_buffer.push(state, action, scaled_reward, next_state, done)
 
@@ -244,7 +264,6 @@ def train_snn(
                 if step_fr > 0.0:
                     episode_firing_rates.append(step_fr)
 
-                # Optimize SNN every `train_freq` steps once warmup is complete
                 if len(replay_buffer) >= max(warmup_steps, batch_size) and (global_step % train_freq == 0):
                     loss_val, batch_fr = optimize_snn_step(
                         policy_net=policy_net,
@@ -265,7 +284,6 @@ def train_snn(
             avg_loss = float(np.mean(episode_losses)) if episode_losses else 0.0
             avg_fr = float(np.mean(episode_firing_rates)) if episode_firing_rates else 0.0
 
-            # Save best model checkpoint once warmup is complete
             if len(reward_window) >= 20 and avg_reward_50 > best_avg_reward:
                 best_avg_reward = avg_reward_50
                 best_path = os.path.join(checkpoint_dir, "snn_policy_best.pth")
@@ -276,6 +294,8 @@ def train_snn(
                         "optimizer_state_dict": optimizer.state_dict(),
                         "avg_reward_50": avg_reward_50,
                         "time_steps": time_steps,
+                        "input_channels": input_channels,
+                        "num_actions": num_actions,
                     },
                     best_path,
                 )
@@ -289,7 +309,7 @@ def train_snn(
                     round(policy_net.lif_fc.beta.mean().item(), 3),
                 ]
                 print(
-                    f"Ep {episode:4d}/{num_episodes} | "
+                    f"Ep {episode:4d}/{start_episode + num_episodes} | "
                     f"Reward: {episode_reward:6.1f} | "
                     f"Avg50: {avg_reward_50:6.1f} | "
                     f"Eps: {epsilon:.2f} | "
@@ -299,15 +319,34 @@ def train_snn(
                     f"Time: {elapsed:.0f}s"
                 )
 
-        # Save final checkpoint
         final_path = os.path.join(checkpoint_dir, "snn_policy_final.pth")
         torch.save(policy_net.state_dict(), final_path)
-        print(f"Training complete! Best 50-ep average reward: {best_avg_reward:.1f}")
+        print(f"Training complete! Best 50-episode average reward: {best_avg_reward:.1f}")
 
     finally:
-        if hasattr(env, "close"):
-            env.close()
+        env.close()
 
 
 if __name__ == "__main__":
-    train_snn()
+    import argparse
+    parser = argparse.ArgumentParser(description="Train or fine-tune Spiking Dueling DQN on ViZDoom")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from (e.g. checkpoints/snn_policy_best.pth)")
+    parser.add_argument("--episodes", type=int, default=800, help="Number of episodes to train")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (e.g. 1e-4 or 5e-5 for fine-tuning)")
+    parser.add_argument("--eps-start", type=float, default=None, help="Initial exploration epsilon (default: 1.0 for scratch, 0.30 if resuming)")
+    parser.add_argument("--eps-end", type=float, default=0.08, help="Final exploration epsilon")
+    parser.add_argument("--decay-episodes", type=int, default=650, help="Episodes over which epsilon decays")
+    args = parser.parse_args()
+
+    kwargs = {
+        "num_episodes": args.episodes,
+        "lr": args.lr,
+        "eps_end": args.eps_end,
+        "eps_decay_episodes": args.decay_episodes,
+    }
+    if args.resume:
+        kwargs["resume_from"] = args.resume
+    if args.eps_start is not None:
+        kwargs["eps_start"] = args.eps_start
+
+    train_snn(**kwargs)
