@@ -21,10 +21,12 @@ class DoomEnv:
         preprocess: bool = True,
         stack_size: int = 4,
         frame_skip: int = 4,
+        resolution: tuple[int, int] = (84, 84),
     ):
         self.preprocess = preprocess
         self.stack_size = stack_size
         self.frame_skip = frame_skip
+        self.resolution = resolution
         self.frame_buffer = deque(maxlen=stack_size)
 
         # 5 Compound Actions matching [MOVE_LEFT, MOVE_RIGHT, ATTACK]
@@ -50,12 +52,12 @@ class DoomEnv:
         self.game.init()
 
     def _process_screen(self, screen_buffer: np.ndarray) -> np.ndarray:
-        """Applies preprocessing and normalizes output to 2D (84, 84) float32."""
+        """Applies preprocessing and normalizes output to 2D (H, W) float32."""
         if screen_buffer is None:
-            return np.zeros((84, 84), dtype=np.float32)
+            return np.zeros(self.resolution, dtype=np.float32)
 
         if self.preprocess:
-            frame = preprocess_frame(screen_buffer)
+            frame = preprocess_frame(screen_buffer, target_size=self.resolution)
         else:
             frame = screen_buffer
 
@@ -116,7 +118,7 @@ class DoomEnv:
             obs = self._get_stacked_state()
         else:
             # Duplicate latest valid frame to preserve stack structure on episode termination
-            last_frame = self.frame_buffer[-1] if len(self.frame_buffer) > 0 else np.zeros((84, 84), dtype=np.float32)
+            last_frame = self.frame_buffer[-1] if len(self.frame_buffer) > 0 else np.zeros(self.resolution, dtype=np.float32)
             self.frame_buffer.append(last_frame)
             obs = self._get_stacked_state()
 
