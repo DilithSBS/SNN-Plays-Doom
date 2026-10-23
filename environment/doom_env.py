@@ -29,16 +29,7 @@ class DoomEnv:
         self.resolution = resolution
         self.frame_buffer = deque(maxlen=stack_size)
 
-        # 5 Compound Actions matching [MOVE_LEFT, MOVE_RIGHT, ATTACK]
-        self.actions = [
-            [1, 0, 0],  # 0: Move Left
-            [0, 1, 0],  # 1: Move Right
-            [0, 0, 1],  # 2: Attack (Shoot)
-            [1, 0, 1],  # 3: Move Left + Attack
-            [0, 1, 1],  # 4: Move Right + Attack
-        ]
-        self.num_actions = len(self.actions)
-        self.action_space_size = self.num_actions
+        self.is_navigation = "my_way_home" in config_path.lower()
 
         # Initialize ViZDoom game instance
         self.game = DoomGame()
@@ -49,6 +40,46 @@ class DoomEnv:
 
         self.game.load_config(config_path)
         self.game.set_window_visible(render)
+
+        if self.is_navigation:
+            # 5 Compound Navigation Actions matching [TURN_LEFT, TURN_RIGHT, MOVE_FORWARD, MOVE_LEFT, MOVE_RIGHT]
+            self.actions = [
+                [1, 0, 0, 0, 0],  # 0: Turn Left
+                [0, 1, 0, 0, 0],  # 1: Turn Right
+                [0, 0, 1, 0, 0],  # 2: Move Forward
+                [1, 0, 1, 0, 0],  # 3: Move Forward + Turn Left
+                [0, 1, 1, 0, 0],  # 4: Move Forward + Turn Right
+            ]
+            self.action_names = {
+                0: "TURN_LEFT  ",
+                1: "TURN_RIGHT ",
+                2: "FORWARD    ",
+                3: "FWD+LEFT   ",
+                4: "FWD+RIGHT  ",
+            }
+            import vizdoom as vzd
+            self.game.add_available_game_variable(vzd.GameVariable.POSITION_X)
+            self.game.add_available_game_variable(vzd.GameVariable.POSITION_Y)
+        else:
+            # 5 Compound Combat Actions matching [MOVE_LEFT, MOVE_RIGHT, ATTACK]
+            self.actions = [
+                [1, 0, 0],  # 0: Move Left
+                [0, 1, 0],  # 1: Move Right
+                [0, 0, 1],  # 2: Attack (Shoot)
+                [1, 0, 1],  # 3: Move Left + Attack
+                [0, 1, 1],  # 4: Move Right + Attack
+            ]
+            self.action_names = {
+                0: "MOVE_LEFT  ",
+                1: "MOVE_RIGHT ",
+                2: "ATTACK     ",
+                3: "LEFT+ATTACK",
+                4: "RIGHT+ATTACK",
+            }
+
+        self.num_actions = len(self.actions)
+        self.action_space_size = self.num_actions
+        self.visited_cells = set()
         self.game.init()
 
     def _process_screen(self, screen_buffer: np.ndarray) -> np.ndarray:
@@ -61,7 +92,7 @@ class DoomEnv:
         else:
             frame = screen_buffer
 
-        # Ensure single 2D slice (84, 84)
+        # Ensure single 2D slice (H, W)
         if isinstance(frame, np.ndarray):
             if frame.ndim == 3 and frame.shape[0] == 1:
                 frame = frame.squeeze(0)
@@ -75,12 +106,23 @@ class DoomEnv:
         return frame
 
     def _get_stacked_state(self) -> np.ndarray:
-        """Stacks the circular deque along axis 0 -> shape (4, 84, 84)."""
+        """Stacks the circular deque along axis 0 -> shape (4, H, W)."""
         return np.stack(self.frame_buffer, axis=0)
 
     def reset(self) -> np.ndarray:
         """Starts a new episode and fills the 4-frame buffer with initial frame duplicates."""
         self.game.new_episode()
+        self.visited_cells.clear()
+
+        if self.is_navigation:
+            try:
+                import vizdoom as vzd
+                px = self.game.get_game_variable(vzd.GameVariable.POSITION_X)
+                py = self.game.get_game_variable(vzd.GameVariable.POSITION_Y)
+                self.visited_cells.add((int(px // 64), int(py // 64)))
+            except Exception:
+                pass
+
         state = self.game.get_state()
         initial_frame = self._process_screen(state.screen_buffer if state else None)
 
@@ -92,7 +134,7 @@ class DoomEnv:
 
     def step(self, action):
         """
-        Executes an action. Accepts either an integer index (0..4) or a 3-element list.
+        Executes an action. Accepts either an integer index (0..4) or a multi-element list.
         Returns: (obs, reward, done, info)
         """
         if isinstance(action, (int, np.integer)):
@@ -105,9 +147,23 @@ class DoomEnv:
         # Execute action with frame_skip ticks
         reward = self.game.make_action(action_vec, self.frame_skip)
 
-        # REWARD SHAPING: Penalize shooting to discourage blind firing
-        if len(action_vec) > 2 and action_vec[2] == 1:
-            reward -= 10.0
+        # REWARD SHAPING
+        if self.is_navigation:
+            # Count-Based Novelty Bonus: reward visiting new 64x64 map grid tiles
+            try:
+                import vizdoom as vzd
+                px = self.game.get_game_variable(vzd.GameVariable.POSITION_X)
+                py = self.game.get_game_variable(vzd.GameVariable.POSITION_Y)
+                cell = (int(px // 64), int(py // 64))
+                if cell not in self.visited_cells:
+                    self.visited_cells.add(cell)
+                    reward += 0.5  # Novelty discovery bonus
+            except Exception:
+                pass
+        else:
+            # Combat: Penalize blind shooting without alignment
+            if len(action_vec) > 2 and action_vec[2] == 1:
+                reward -= 10.0
 
         done = self.game.is_episode_finished()
 
@@ -117,12 +173,14 @@ class DoomEnv:
             self.frame_buffer.append(frame)
             obs = self._get_stacked_state()
         else:
-            # Duplicate latest valid frame to preserve stack structure on episode termination
             last_frame = self.frame_buffer[-1] if len(self.frame_buffer) > 0 else np.zeros(self.resolution, dtype=np.float32)
             self.frame_buffer.append(last_frame)
             obs = self._get_stacked_state()
 
-        info = {"kills": 0}
+        info = {
+            "kills": 0,
+            "cells_visited": len(self.visited_cells) if self.is_navigation else 0,
+        }
         return obs, reward, done, info
 
     def close(self):
@@ -130,17 +188,19 @@ class DoomEnv:
 
 
 if __name__ == "__main__":
-    print("Testing updated DoomEnv with 4-frame stacking...")
-    env = DoomEnv(render=False)
-    print(f"Action space size: {env.num_actions}")
-    obs = env.reset()
-    print(f"Observation stack shape: {obs.shape} (Expected: (4, 84, 84))")
+    print("Testing DoomEnv with basic.cfg (Combat)...")
+    env_combat = DoomEnv(config_path="configs/basic.cfg", render=False)
+    print(f"Combat Actions: {env_combat.num_actions} -> {env_combat.actions}")
+    obs_c = env_combat.reset()
+    print(f"Obs shape: {obs_c.shape}")
+    env_combat.close()
 
-    for i in range(5):
-        action_idx = np.random.randint(0, env.num_actions)
-        obs, reward, done, _ = env.step(action_idx)
-        print(f"Step {i+1} | Action {action_idx}: {env.actions[action_idx]} | Obs shape: {obs.shape} | Reward: {reward:.1f}")
-        if done:
-            break
-    env.close()
-    print("Test passed successfully.")
+    print("\nTesting DoomEnv with my_way_home.cfg (Navigation)...")
+    env_nav = DoomEnv(config_path="configs/my_way_home.cfg", render=False)
+    print(f"Nav Actions: {env_nav.num_actions} -> {env_nav.actions}")
+    obs_n = env_nav.reset()
+    print(f"Obs shape: {obs_n.shape}")
+    obs_step, rew, done, info = env_nav.step(2)  # Move forward
+    print(f"Step 1: Reward={rew:.2f}, Done={done}, Info={info}")
+    env_nav.close()
+    print("All tests passed successfully!")

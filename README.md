@@ -99,6 +99,28 @@ python environment/test_vizdoom.py
 
 ---
 
+## 🕹️ Interactive Human Play (Play with Keyboard & Mouse)
+
+Want to jump into Doom and play it yourself using your keyboard and mouse? A complete interactive environment is located in [`human_play/`](file:///home/dilith_s_b_s/UoP/MyProjects/SNN_doomplay/SNN-Plays-Doom/human_play):
+
+```bash
+# 1. Play Combat Arena (WASD to move, Mouse / Ctrl / Space to shoot):
+./human_play/play.sh
+
+# 2. Play 3D Labyrinth Traversal:
+./human_play/play.sh --scenario my_way_home
+
+# 3. Play 360° Circular Arena Defense:
+./human_play/play.sh --scenario defend_the_center
+
+# High-resolution (1024x768) or record gameplay to an MP4 video:
+./human_play/play.sh --res 1024x768 --record my_gameplay.mp4
+```
+
+See the [Human Play Guide](file:///home/dilith_s_b_s/UoP/MyProjects/SNN_doomplay/SNN-Plays-Doom/human_play/README.md) for the complete keyboard & mouse control bindings table.
+
+---
+
 ## 🎮 Running & Evaluating Models
 
 Pre-trained weights are located in [`checkpoints/`](file:///home/dilith_s_b_s/UoP/MyProjects/SNN_doomplay/SNN-Plays-Doom/checkpoints).
@@ -150,14 +172,25 @@ Sample output:
 Script: [`evaluation/evaluate_snn.py`](file:///home/dilith_s_b_s/UoP/MyProjects/SNN_doomplay/SNN-Plays-Doom/evaluation/evaluate_snn.py)
 
 ```bash
-python evaluation/evaluate_snn.py --checkpoint checkpoints/snn_policy_best.pth --episodes 10
+python evaluation/evaluate_snn.py --render --episodes 10
 ```
 
-### 3. Evaluate the Classical ANN (CNN) Baseline
+### 3. Evaluate the Classical ANN Baseline (84×84, FP32, ReLU)
 Script: [`evaluation/evaluate_ann.py`](file:///home/dilith_s_b_s/UoP/MyProjects/SNN_doomplay/SNN-Plays-Doom/evaluation/evaluate_ann.py)
 
 ```bash
-python evaluation/evaluate_ann.py --checkpoint checkpoints/ann_best.pth --episodes 10
+python evaluation/evaluate_ann.py --render --episodes 10
+```
+
+### 4. Evaluate the SNAP-V 3D Navigation Model (my_way_home Labyrinth)
+Script: [`evaluation/evaluate_nav.py`](file:///home/dilith_s_b_s/UoP/MyProjects/SNN_doomplay/SNN-Plays-Doom/evaluation/evaluate_nav.py)
+
+```bash
+# Watch the agent navigate the labyrinth with live window rendering:
+python evaluation/evaluate_nav.py --render --episodes 5 --fps 25
+
+# Headless benchmark tracking maze solutions and unique rooms explored:
+python evaluation/evaluate_nav.py --no-render --episodes 20
 ```
 
 ---
@@ -166,7 +199,7 @@ python evaluation/evaluate_ann.py --checkpoint checkpoints/ann_best.pth --episod
 
 All training happens **off-chip on your CPU / GPU** using PyTorch. The SNAP-V FPGA only runs on-chip inference.
 
-### 1. Train the SNAP-V Hardware-Constrained Model (Recommended)
+### 1. Train the SNAP-V Combat Model (basic.cfg)
 Script: [`training/train_snapv.py`](file:///home/dilith_s_b_s/UoP/MyProjects/SNN_doomplay/SNN-Plays-Doom/training/train_snapv.py)
 
 Train with **Off-Chip Teacher Distillation** from the baseline SNN:
@@ -179,19 +212,20 @@ Train standalone from scratch without a teacher:
 python training/train_snapv.py --episodes 800
 ```
 
-Options:
-- `--render` / `--no-render`: Toggle live window during training (default: headless for speed).
-- `--teacher <path>`: Path to teacher checkpoint (e.g. `checkpoints/snn_policy_best.pth`).
-- `--resume <path>`: Resume from existing checkpoint (e.g. `checkpoints/snapv_policy_best.pth`).
-- `--distill-weight <float>`: Distillation loss coefficient (default: `0.50`).
-- `--guide-prob <float>`: Teacher action guidance probability during exploration (default: `0.25`).
+### 2. Train the SNAP-V 3D Navigation Model (my_way_home.cfg)
+Script: [`training/train_nav.py`](file:///home/dilith_s_b_s/UoP/MyProjects/SNN_doomplay/SNN-Plays-Doom/training/train_nav.py)
 
-### 2. Train the Unconstrained Baseline SNN
+Trains spatial traversal with count-based grid novelty exploration bonuses:
+```bash
+python training/train_nav.py --episodes 800
+```
+
+### 3. Train the Unconstrained Baseline SNN (Combat)
 ```bash
 python training/train_snn.py --episodes 800
 ```
 
-### 3. Train the Classical ANN Baseline
+### 4. Train the Classical ANN Baseline
 ```bash
 python training/train_ann.py --episodes 300
 ```
@@ -246,18 +280,21 @@ Evaluated on 50 consecutive episodes in the ViZDoom `basic` scenario:
 ```
 SNN-Plays-Doom/
 ├── checkpoints/              # Saved model weights
-│   ├── snapv_policy_best.pth # Best trained SNAP-V hardware model
+│   ├── snapv_policy_best.pth # Best trained SNAP-V combat model
+│   ├── nav_snapv_best.pth    # Best trained SNAP-V 3D navigation model
 │   ├── snn_policy_best.pth   # Best baseline software SNN model
 │   └── ann_policy_best.pth   # Classical CNN baseline weights
 ├── configs/                  # ViZDoom scenario definitions
-│   ├── basic.cfg             # Game config (compound action space)
-│   └── basic.wad             # Doom map binary
+│   ├── basic.cfg             # Combat scenario config
+│   ├── basic.wad             # Combat scenario map asset
+│   ├── my_way_home.cfg       # 3D navigation labyrinth config
+│   └── my_way_home.wad       # 3D labyrinth map asset
 ├── deployment/               # SNAP-V FPGA deployment suite
 │   ├── export_snapv.py       # Hardware compiler & INT8 weight exporter
 │   ├── snapv_model.bin       # Packed INT8 binary blob for FPGA SRAM DMA
 │   └── snapv_model.h         # Embedded C header with 32-cluster mapping
 ├── environment/              # Environment interface
-│   ├── doom_env.py           # Gym-like DoomEnv wrapper (supports 84x84 & 32x32)
+│   ├── doom_env.py           # Gym-like DoomEnv wrapper (combat & navigation)
 │   └── test_vizdoom.py       # ViZDoom sanity test script
 ├── preprocessing/            # Vision transforms
 │   └── image_processing.py   # Grayscale downscaling & normalization
@@ -268,14 +305,24 @@ SNN-Plays-Doom/
 │       ├── snapv_snn.py      # SnapVSpikingDQN, ShiftLIF, QuantConv2d, QuantLinear
 │       └── spiking_cnn.py    # SpikingDuelingDQN with ParametricLIF neurons
 ├── training/                 # RL training pipelines
-│   ├── train_snapv.py        # SNAP-V training loop with Teacher Distillation & NoC loss
-│   ├── train_snn.py          # Software SNN DDQN training loop
+│   ├── train_snapv.py        # SNAP-V combat training (Teacher Distillation & NoC loss)
+│   ├── train_nav.py          # SNAP-V 3D navigation training (Novelty exploration)
+│   ├── train_snn.py          # Baseline software SNN DDQN training loop
 │   └── train_ann.py          # Classical ANN DQN training loop
 ├── evaluation/               # Benchmarking & live visualization
-│   ├── evaluate_snapv.py     # SNAP-V evaluation with NoC telemetry & action stats
+│   ├── evaluate_snapv.py     # SNAP-V combat evaluation & telemetry
+│   ├── evaluate_nav.py       # SNAP-V 3D navigation evaluation & maze tracking
 │   ├── evaluate_snn.py       # Baseline SNN evaluation with spike telemetry
 │   ├── evaluate_ann.py       # ANN evaluation script
 │   └── random_baseline.py    # Random action baseline
+├── human_play/               # Interactive human gameplay suite (Keyboard & Mouse)
+│   ├── play.py               # Main interactive game runner with HUD & controls
+│   ├── play.sh               # Quick executable launcher script
+│   ├── README.md             # Controls reference & human play documentation
+│   └── configs/              # High-res human play scenario configurations
+│       ├── human_basic.cfg
+│       ├── human_my_way_home.cfg
+│       └── human_defend_the_center.cfg
 ├── requirements.txt          # Python package manifest
 ├── README.md                 # Project guide (this file)
 └── DEV_GUIDE.md              # In-depth architectural & mathematical guide

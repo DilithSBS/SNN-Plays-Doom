@@ -239,3 +239,78 @@ SNAP-V consists of 32 physical neuromorphic clusters, each with dedicated local 
 | **`argparse --render` parsing errors** | Standard Python `type=bool` treats `"False"` as boolean `True`. | Use `str2bool` helper with both `--render` and `--no-render` flags. |
 | **ViZDoom crash: missing X11 display** | Running in a headless terminal or SSH session without GUI forwarding. | Pass `--no-render` or use `xvfb-run -a python evaluation/evaluate_snapv.py`. |
 | **Teacher checkpoint not found during training** | Path typo or training baseline was not completed. | Ensure `checkpoints/snn_policy_best.pth` exists or run `python training/train_snn.py` first. |
+
+---
+
+## 7. 3D Spatial Navigation Pipeline (`my_way_home.cfg`)
+
+Moving from 2D arena combat (`basic.cfg`) to 3D multi-room labyrinth traversal (`my_way_home.cfg`) transitions the reinforcement learning problem from reactive visual tracking into a **Partially Observable Markov Decision Process (POMDP)** requiring long-horizon credit assignment and pathfinding.
+
+### 7.1 Problem Formulation: Combat vs. Traversal
+
+```
+┌─────────────────────────────────┬────────────────────────────────────────┐
+│ Arena Combat (basic.cfg)        │ 3D Labyrinth Traversal (my_way_home)   │
+├─────────────────────────────────┼────────────────────────────────────────┤
+│ • Static single-room camera     │ • First-person multi-room labyrinth    │
+│ • Fixed monster in view         │ • Spawn in random isolated room        │
+│ • Dense reward (+100 kill, -5)  │ • Highly sparse reward (+100 at goal)  │
+│ • Horizon: ~30 steps            │ • Horizon: 100 – 2,100 steps           │
+│ • Primary challenge: Targeting  │ • Primary challenge: Exploration / NoC │
+└─────────────────────────────────┴────────────────────────────────────────┘
+```
+
+In `my_way_home`, the player must navigate through corridors with distinctive wall textures (blue, green, brown, stone) to reach the green armor vest. ViZDoom provides episodic rewards:
+- **Reaching the goal (armor)**: $+100$
+- **Step living penalty**: $-0.0005$ per tick
+
+### 7.2 Navigation Compound Action Space
+
+To allow smooth corridor navigation without stuttering, the action space is mapped to 5 compound motor commands in [`environment/doom_env.py`](file:///home/dilith_s_b_s/UoP/MyProjects/SNN_doomplay/SNN-Plays-Doom/environment/doom_env.py):
+
+| Action ID | Name | ViZDoom Button Vector `[TURN_LEFT, TURN_RIGHT, MOVE_FORWARD]` | Tactical Function |
+|---|---|---|---|
+| **0** | `TURN_LEFT` | `[1, 0, 0]` | Pivot left in place (scan surroundings) |
+| **1** | `TURN_RIGHT` | `[0, 1, 0]` | Pivot right in place (scan surroundings) |
+| **2** | `MOVE_FORWARD` | `[0, 0, 1]` | Straight advance along hallway |
+| **3** | `FWD + TURN_LEFT` | `[1, 0, 1]` | Smooth arc-turn left through doorway |
+| **4** | `FWD + TURN_RIGHT` | `[0, 1, 1]` | Smooth arc-turn right through doorway |
+
+Because $|\mathcal{A}| = 5$, the navigation policy utilizes the exact same [`SnapVSpikingDQN`](file:///home/dilith_s_b_s/UoP/MyProjects/SNN_doomplay/SNN-Plays-Doom/models/snn/snapv_snn.py) architecture, preserving 100% compatibility with SNAP-V Cluster 31 (5 Advantage + 1 Value).
+
+### 7.3 Count-Based Spatial Novelty Exploration
+
+#### The "Donut Loop" Reward Hacking Trap:
+Rewarding raw agent velocity or step displacement induces pathological failure modes: the agent spins in tight circles or vibrates back and forth in the spawn room to accumulate reward without ever exploring corridors.
+
+#### Solution: Episodic Grid Discretization:
+The game coordinate space is discretized into $64 \times 64$ world-unit tiles:
+
+$$g_x = \lfloor x / 64.0 \rfloor, \quad g_y = \lfloor y / 64.0 \rfloor$$
+
+When the agent transitions into a tile, an intrinsic novelty bonus is added:
+
+$$r_{\text{intrinsic}} = \frac{\eta}{\sqrt{N(g_x, g_y)}}$$
+
+Where:
+- $\eta = 0.5$ is the exploration scaling coefficient.
+- $N(g_x, g_y)$ is the total visit count for tile $(g_x, g_y)$ within the current episode.
+
+On the **first visit** to a new tile ($N=1$), the agent receives $+0.50$. Subsequent visits yield diminishing returns ($\approx 0.35, 0.29, 0.25, \dots$), motivating the SNN policy to seek out uncharted corridors while ignoring previously traversed loops.
+
+### 7.4 Symmetric Rotational Augmentation
+
+During replay buffer training in [`training/train_nav.py`](file:///home/dilith_s_b_s/UoP/MyProjects/SNN_doomplay/SNN-Plays-Doom/training/train_nav.py), horizontal frame flipping preserves navigation physics via the following action inversion:
+
+$$\text{Flip}(a) = \begin{cases} 1 & \text{if } a = 0 \text{ (TURN\_LEFT} \to \text{TURN\_RIGHT)} \\ 0 & \text{if } a = 1 \text{ (TURN\_RIGHT} \to \text{TURN\_LEFT)} \\ 2 & \text{if } a = 2 \text{ (MOVE\_FORWARD is invariant)} \\ 4 & \text{if } a = 3 \text{ (FWD+LEFT} \to \text{FWD+RIGHT)} \\ 3 & \text{if } a = 4 \text{ (FWD+RIGHT} \to \text{FWD+LEFT)} \end{cases}$$
+
+This doubles the effective spatial variety of hallway visual patterns without collecting additional environment steps.
+
+### 7.5 Temporal Dynamics & Hardware Compatibility
+
+- **Intra-Step SNN Dynamics ($T=4$)**: Within each 4-tick simulation window, `ShiftLIF` neurons integrate edge contrasts from wall textures and motion parallax.
+- **Inter-Step Observation Stacking (4 frames)**: Four consecutive downsampled $32 \times 32$ frames provide forward velocity and rotational angular momentum without requiring multi-hundred-step recurrent BPTT.
+- **SNAP-V Deployment Ready**: The trained navigation checkpoint ([`checkpoints/nav_snapv_best.pth`](file:///home/dilith_s_b_s/UoP/MyProjects/SNN_doomplay/SNN-Plays-Doom/checkpoints/nav_snapv_best.pth)) directly complies with:
+  - 155,776 INT8 synapses (29.7% SRAM).
+  - 32-cluster mapping configuration.
+  - Zero-floating-point bit-shift arithmetic (`k=2` and `k=3`).
